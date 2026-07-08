@@ -28,22 +28,24 @@ class SignatureChecker:
 
         height, width = image.shape[:2]
 
-        y1 = int(height * SignatureChecker.REGION_TOP)
-        x1 = int(width * SignatureChecker.REGION_LEFT)
+        def detect_region(region):
+            if region.size == 0:
+                return 0.0
 
-        region = image[y1:height, x1:width]
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY) if len(region.shape) == 3 else region
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            ink_pixels = cv2.countNonZero(thresholded)
+            total_pixels = thresholded.size
+            return ink_pixels / total_pixels if total_pixels else 0
 
-        if region.size == 0:
-            return False, "Signature region not found"
+        regions = [
+            image[int(height * SignatureChecker.REGION_TOP):height, int(width * SignatureChecker.REGION_LEFT):width],
+            image[int(height * 0.55):height, 0:width],
+            image[int(height * 0.65):height, int(width * 0.35):width]
+        ]
 
-        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY) if len(region.shape) == 3 else region
-
-        _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-        ink_pixels = cv2.countNonZero(thresholded)
-        total_pixels = thresholded.size
-
-        ink_ratio = ink_pixels / total_pixels if total_pixels else 0
+        ink_ratio = max(detect_region(region) for region in regions)
 
         if ink_ratio < SignatureChecker.MIN_INK_RATIO:
             return False, "Signature not detected"

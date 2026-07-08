@@ -1,5 +1,8 @@
-from ultralytics import YOLO
 from pathlib import Path
+from ultralytics import YOLO
+
+from ..config import get_settings
+from ..utils.exceptions import PipelineError
 
 
 class ChequeDetector:
@@ -7,32 +10,36 @@ class ChequeDetector:
     def __init__(self):
         print("Loading YOLO model...")
 
-        model_path = Path(__file__).resolve().parents[2] / "yolov8n.pt"
-        self.model = YOLO(str(model_path))
+        settings = get_settings()
+        model_path = settings.model_path
+        if not model_path.exists():
+            raise PipelineError(
+                "YOLO model file was not found",
+                "MODEL_NOT_FOUND",
+                {"model_path": str(model_path)}
+            )
 
-        print("Model Loaded Successfully")
+        self.model = YOLO(str(model_path))
+        self.confidence_threshold = settings.yolo_confidence_threshold
+
+        print(f"Model Loaded Successfully: {model_path}")
 
     def detect(self, image_path):
-
         results = self.model.predict(
-            source=image_path,
-            conf=0.40,
-            save=False
+            source=str(image_path),
+            conf=self.confidence_threshold,
+            save=False,
+            verbose=False
         )
 
         detections = []
 
         for result in results:
-
             for box in result.boxes:
-
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-
                 class_id = int(box.cls[0])
-
                 confidence = float(box.conf[0])
-
-                class_name = self.model.names[class_id]
+                class_name = self.model.names[class_id].lower()
 
                 detections.append({
                     "class": class_name,

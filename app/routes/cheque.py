@@ -4,7 +4,10 @@ from uuid import uuid4
 import shutil
 import cv2
 import fitz
+import numpy as np
+from PIL import Image as PILImage
 
+from ..config import get_settings
 from ..services.image_quality import ImageQuality
 from ..services.detector import ChequeDetector
 from ..services.cropper import Cropper
@@ -37,25 +40,26 @@ def _render_pdf_pages(pdf_path):
 
     print("Opening:", pdf_path)
 
+    settings = get_settings()
     pdf = fitz.open(str(pdf_path))
 
     print("Pages:", len(pdf))
 
     rendered = []
+    texts = []
 
     for i, page in enumerate(pdf):
 
-        pix = page.get_pixmap()
-
-        img = pdf_path.with_name(f"page_{i}.jpg")
-
+        pix = page.get_pixmap(dpi=settings.pdf_dpi, alpha=False)
+        img = pdf_path.with_name(f"{pdf_path.stem}_page_{i}.png")
         pix.save(str(img))
-
         rendered.append(img)
+
+        texts.append(Parser.clean_text(page.get_text()))
 
     pdf.close()
 
-    return rendered
+    return rendered, texts
 
 
 def _extract_fields(text):
@@ -89,6 +93,19 @@ def _build_cheque_result(fields, validations, signature_status):
     }
 
 
+def _get_page_text(image_path, pdf_texts, page_index, ocr):
+    if pdf_texts and page_index - 1 < len(pdf_texts) and pdf_texts[page_index - 1]:
+        return pdf_texts[page_index - 1]
+
+    ocr_raw_result = ocr.read_text(str(image_path))
+    ocr_text, _ = ocr.extract_text(ocr_raw_result)
+
+    if not ocr_text and pdf_texts and page_index - 1 < len(pdf_texts):
+        return pdf_texts[page_index - 1]
+
+    return ocr_text
+
+
 @router.post("/upload")
 async def upload_cheque(file: UploadFile = File(...)):
 
@@ -112,11 +129,13 @@ async def upload_cheque(file: UploadFile = File(...)):
     if not size_status:
         return _response(False, size_message, [])
 
+    is_pdf = extension == ".pdf"
     image_paths = [file_path]
+    pdf_texts = []
 
-    if extension == ".pdf":
+    if is_pdf:
         try:
-            image_paths = _render_pdf_pages(file_path)
+            image_paths, pdf_texts = _render_pdf_pages(file_path)
         except Exception as e:
             return _response(False, f"PDF Error : {str(e)}", [])
 
@@ -131,13 +150,25 @@ async def upload_cheque(file: UploadFile = File(...)):
     for page_index, image_path in enumerate(image_paths, start=1):
         image = cv2.imread(str(image_path))
         if image is None:
-            continue
+            try:
+                pil_image = PILImage.open(str(image_path)).convert("RGB")
+                image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+            except Exception:
+                continue
 
         resolution_status, _ = ImageQuality.check_resolution(image)
         blur_status, _ = ImageQuality.check_blur(image)
         brightness_status, _ = ImageQuality.check_brightness(image)
 
         if not (resolution_status and blur_status and brightness_status):
+            ocr_text = _get_page_text(image_path, pdf_texts, page_index, ocr)
+            fields = _extract_fields(ocr_text)
+            signature_status, _ = SignatureChecker.check_signature(image)
+            validations = _validate_fields(fields, signature_status)
+
+            cheque_results.append(
+                _build_cheque_result(fields, validations, signature_status)
+            )
             continue
 
         detections = detector.detect(str(image_path))
@@ -146,31 +177,36 @@ async def upload_cheque(file: UploadFile = File(...)):
             if d["class"].lower() == "cheque"
         ]
 
-        if not cheques:
-            continue
+        if cheques:
+            cropped_images = Cropper.crop_fields(
+                str(image_path),
+                cheques,
+                output_prefix=f"{file_path.stem}_page_{page_index}"
+            )
 
-        cropped_images = Cropper.crop_fields(
-            str(image_path),
-            cheques,
-            output_prefix=f"{file_path.stem}_page_{page_index}"
-        )
+            for cheque_index, cheque in enumerate(cheques, start=1):
+                crop_key = f"{cheque['class']}_{cheque_index}"
+                crop_path = cropped_images.get(crop_key)
 
-        for cheque_index, cheque in enumerate(cheques, start=1):
-            crop_key = f"{cheque['class']}_{cheque_index}"
-            crop_path = cropped_images.get(crop_key)
+                if not crop_path:
+                    continue
 
-            if not crop_path:
-                # Skip this cheque crop if it wasn't produced by the cropper
-                continue
+                ocr_raw_result = ocr.read_text(crop_path)
+                ocr_text, _ = ocr.extract_text(ocr_raw_result)
 
-            ocr_raw_result = ocr.read_text(crop_path)
-            ocr_text, _ = ocr.extract_text(ocr_raw_result)
+                fields = _extract_fields(ocr_text)
+                crop_image = cv2.imread(crop_path)
+                signature_status, _ = SignatureChecker.check_signature(crop_image)
+                validations = _validate_fields(fields, signature_status)
 
+                cheque_results.append(
+                    _build_cheque_result(fields, validations, signature_status)
+                )
+        else:
+            # Fallback: when no cheque box is detected, OCR the full page and attempt to extract fields.
+            ocr_text = _get_page_text(image_path, pdf_texts, page_index, ocr)
             fields = _extract_fields(ocr_text)
-
-            crop_image = cv2.imread(crop_path)
-            signature_status, _ = SignatureChecker.check_signature(crop_image)
-
+            signature_status, _ = SignatureChecker.check_signature(image)
             validations = _validate_fields(fields, signature_status)
 
             cheque_results.append(
@@ -181,7 +217,7 @@ async def upload_cheque(file: UploadFile = File(...)):
         return _response(False, "No cheque detected", [])
 
     all_valid = all(cheque["valid"] for cheque in cheque_results)
-    message = "Cheque validated successfully" if all_valid else "Cheque validation failed"
+    message = "Cheque processed successfully" if all_valid else "Cheque processed with validation failures"
 
     overall_validation = {
         "total_cheques": len(cheque_results),
@@ -189,4 +225,4 @@ async def upload_cheque(file: UploadFile = File(...)):
         "invalid_cheques": sum(1 for c in cheque_results if not c["valid"])
     }
 
-    return _response(all_valid, message, cheque_results, overall_validation)
+    return _response(True, message, cheque_results, overall_validation)
