@@ -118,6 +118,17 @@ class Parser:
 
         cleaned_text = Parser.clean_text(text)
 
+        keyword_match = re.search(
+            r"(?:a/c|account|acc(?:ount)?)(?:\s*no|\s*number|\s*#)?[:\s-]{0,10}(\d[\d\s-]{7,20}\d)",
+            cleaned_text,
+            re.IGNORECASE
+        )
+
+        if keyword_match:
+            candidate = Parser.clean_account(keyword_match.group(1))
+            if 9 <= len(candidate) <= 18:
+                return candidate
+
         groups = re.findall(r"\d[\d\s-]{7,20}\d", cleaned_text)
 
         candidates = [
@@ -135,12 +146,26 @@ class Parser:
 
     @staticmethod
     def extract_cheque_number(text):
-        """Find a standalone 6 digit cheque number."""
+        """Find a cheque number by keyword or standalone digits."""
 
         cleaned_text = Parser.clean_text(text)
 
-        matches = re.findall(r"\b\d{6}\b", cleaned_text)
+        keyword_match = re.search(
+            r"(?:cheque|check|chq)(?:\s*(?:no|number)?)[^\d]*(\d[\d\s-]{3,7}\d)",
+            cleaned_text,
+            re.IGNORECASE
+        )
 
+        if keyword_match:
+            candidate = Parser.clean_cheque_number(keyword_match.group(1))
+            if 4 <= len(candidate) <= 8:
+                return candidate
+
+        matches = re.findall(r"\b\d{6}\b", cleaned_text)
+        if matches:
+            return matches[0]
+
+        matches = re.findall(r"\b\d{5,8}\b", cleaned_text)
         return matches[0] if matches else ""
 
     @staticmethod
@@ -180,6 +205,9 @@ class Parser:
             current_phrase.append(word)
 
         if len(current_phrase) >= 2 and len(current_phrase) > len(best_phrase):
+            best_phrase = current_phrase
+
+        if not best_phrase and current_phrase:
             best_phrase = current_phrase
 
         return " ".join(best_phrase).upper()

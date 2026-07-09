@@ -18,7 +18,6 @@ class SignatureChecker:
     REGION_LEFT = 0.55
 
     MIN_INK_RATIO = 0.01
-    MAX_INK_RATIO = 0.55
 
     @staticmethod
     def check_signature(image):
@@ -49,8 +48,5 @@ class SignatureChecker:
 
         if ink_ratio < SignatureChecker.MIN_INK_RATIO:
             return False, "Signature not detected"
-
-        if ink_ratio > SignatureChecker.MAX_INK_RATIO:
-            return False, "Signature region unclear or noisy"
 
         return True, "Signature detected"
