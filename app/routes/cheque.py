@@ -58,6 +58,8 @@ def _render_pdf_pages(pdf_path):
         texts.append(Parser.clean_text(page.get_text()))
 
     pdf.close()
+    print("Rendered pages:", len(rendered))
+    print("Extracted texts:", len(texts))
 
     return rendered, texts
 
@@ -94,10 +96,12 @@ def _build_cheque_result(fields, validations, signature_status):
 
 
 def _get_page_text(image_path, pdf_texts, page_index, ocr):
+    # print(f"Page {page_index}: Extracting text from image: {image_path} and PDF texts: {pdf_texts} and page index: {page_index} and ocr: {ocr}")
     if pdf_texts and page_index - 1 < len(pdf_texts) and pdf_texts[page_index - 1]:
         return pdf_texts[page_index - 1]
 
     ocr_raw_result = ocr.read_text(str(image_path))
+    # print(f"Page {page_index}: OCR Raw Result: {ocr_raw_result}")
     ocr_text, _ = ocr.extract_text(ocr_raw_result)
 
     if not ocr_text and pdf_texts and page_index - 1 < len(pdf_texts):
@@ -136,6 +140,8 @@ async def upload_cheque(file: UploadFile = File(...)):
     if is_pdf:
         try:
             image_paths, pdf_texts = _render_pdf_pages(file_path)
+            print(f"Rendered {len(image_paths)} pages from PDF: {file_path}")
+            print(f"Extracted texts: {len(pdf_texts)}")
         except Exception as e:
             return _response(False, f"PDF Error : {str(e)}", [])
 
@@ -162,6 +168,7 @@ async def upload_cheque(file: UploadFile = File(...)):
 
         if not (resolution_status and blur_status and brightness_status):
             ocr_text = _get_page_text(image_path, pdf_texts, page_index, ocr)
+            # print(f"Page {page_index}: OCR Text: {ocr_text}")
             fields = _extract_fields(ocr_text)
             signature_status, _ = SignatureChecker.check_signature(image)
             validations = _validate_fields(fields, signature_status)

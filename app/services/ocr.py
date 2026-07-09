@@ -66,16 +66,54 @@ class OCRService:
         self.Image = Image
         self.backend = "pytesseract"
 
+    # ------------------------------------------------------------------
+    # Orientation handling & preprocessing
+    #
+    # Cheque crops (whether coming from a YOLO detection box or a full
+    # page render) are frequently rotated 90/180/270 degrees - e.g. a
+    # portrait photo of a physically landscape cheque - and are often
+    # small/low-resolution. Neither the pytesseract nor the PaddleOCR
+    # path previously corrected for this, so OCR would silently read
+    # sideways text and return garbage/empty results even though the
+    # cheque itself contained perfectly legible fields. The helpers
+    # below upscale/contrast-boost the image and try each orientation,
+    # scoring the result against common cheque vocabulary so the best
+    # orientation is used instead of whatever the crop happened to be.
+    # ------------------------------------------------------------------
+
+    _ORIENTATION_KEYWORDS = (
+        "BANK", "PAY", "RUPEES", "ACCOUNT", "IFSC", "CHEQUE", "SIGN",
+        "ONLY", "BEARER", "ORDER", "BRANCH", "DATE", "VALID", "MICR"
+    )
+    _CONFIDENT_KEYWORD_HITS = 3
+    _MIN_OCR_WIDTH = 1600
+
+    @classmethod
+    def _score_orientation(cls, text):
+        if not text:
+            return 0
+        upper = text.upper()
+        return sum(1 for kw in cls._ORIENTATION_KEYWORDS if kw in upper)
+
+    def _preprocess_pil_image(self, pil_image):
+        """Upscale small crops and boost contrast so OCR has a fair chance."""
+        from PIL import ImageOps
+
+        image = pil_image.convert("L")
+
+        if image.width and image.width < self._MIN_OCR_WIDTH:
+            scale = max(1, self._MIN_OCR_WIDTH // image.width)
+            image = image.resize((image.width * scale, image.height * scale), self.Image.LANCZOS)
+
+        return ImageOps.autocontrast(image)
+
     def read_text(self, image_path: str):
         if self.backend == "pytesseract":
             return self._read_text_tesseract(image_path)
 
         if self.backend == "paddle":
             try:
-                if hasattr(self.ocr, "predict"):
-                    return self.ocr.predict(image_path)
-                if hasattr(self.ocr, "ocr"):
-                    return self.ocr.ocr(image_path)
+                return self._read_text_paddle(image_path)
             except Exception as exc:
                 print("PaddleOCR failed during read_text:", exc)
                 self.backend = None
@@ -89,8 +127,65 @@ class OCRService:
 
     def _read_text_tesseract(self, image_path: str):
         img = self.Image.open(image_path)
-        text = self.pytesseract.image_to_string(img)
-        return [[[None, [text, 0.0]]]]
+
+        best_text = ""
+        best_score = -1
+
+        for angle in (0, 90, 180, 270):
+            rotated = img.rotate(angle, expand=True) if angle else img
+            processed = self._preprocess_pil_image(rotated)
+
+            try:
+                text = self.pytesseract.image_to_string(processed, config="--psm 6")
+            except Exception as exc:
+                print(f"Tesseract failed at rotation {angle}:", exc)
+                continue
+
+            score = self._score_orientation(text)
+
+            # Once an orientation clearly reads like a cheque, stop early
+            # instead of burning three more OCR passes on every image.
+            if score >= self._CONFIDENT_KEYWORD_HITS:
+                return [[[None, [text, 0.0]]]]
+
+            if score > best_score:
+                best_score = score
+                best_text = text
+
+        return [[[None, [best_text, 0.0]]]]
+
+    def _read_text_paddle(self, image_path: str):
+        import numpy as np
+        import cv2
+
+        original = self.Image.open(image_path)
+
+        best_result = None
+        best_score = -1
+
+        for angle in (0, 90, 180, 270):
+            rotated = original.rotate(angle, expand=True) if angle else original
+            processed = self._preprocess_pil_image(rotated)
+            array = cv2.cvtColor(np.array(processed.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+            if hasattr(self.ocr, "predict"):
+                result = self.ocr.predict(array)
+            elif hasattr(self.ocr, "ocr"):
+                result = self.ocr.ocr(array)
+            else:
+                result = None
+
+            text, _ = self.extract_text(result)
+            score = self._score_orientation(text)
+
+            if score >= self._CONFIDENT_KEYWORD_HITS:
+                return result
+
+            if score > best_score:
+                best_score = score
+                best_result = result
+
+        return best_result
 
     def extract_text(self, result):
         text = []
