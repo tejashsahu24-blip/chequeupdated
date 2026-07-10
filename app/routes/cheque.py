@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from fastapi import APIRouter, UploadFile, File
 from pathlib import Path
 from uuid import uuid4
@@ -34,6 +36,18 @@ def _response(status, message, cheques, validations=None):
             "cheques": cheques
         }
     }
+
+
+@lru_cache(maxsize=1)
+def _get_detector():
+    """Load the model once per API worker, not once per uploaded file."""
+    return ChequeDetector()
+
+
+@lru_cache(maxsize=1)
+def _get_ocr():
+    """OCR startup is expensive, so retain the initialized backend."""
+    return OCRService()
 
 
 def _render_pdf_pages(pdf_path):
@@ -83,13 +97,15 @@ def _validate_fields(fields, signature_status):
 
 
 def _build_cheque_result(fields, validations, signature_status):
+    # Keep this shape stable even when a field could not be read.  API
+    # consumers can therefore always rely on the same JSON keys.
     return {
         "account_no": fields.get("account_number"),
         "ifsc": fields.get("ifsc"),
         "customer_name": fields.get("customer_name"),
         "cheque_no": fields.get("cheque_number"),
         "cts": fields.get("cts"),
-        "signature_detected": signature_status,
+        "signature": signature_status,
         "validations": validations,
         "valid": validations.get("is_valid", False)
     }
@@ -110,6 +126,22 @@ def _get_page_text(image_path, pdf_texts, page_index, ocr):
     return ocr_text
 
 
+def _get_cheque_text(image_path, pdf_texts, page_index, ocr):
+    """Combine page OCR/PDF text with targeted CTS and serial-number reads."""
+    page_text = _get_page_text(image_path, pdf_texts, page_index, ocr)
+    field_hints = ocr.read_cheque_field_hints(str(image_path))
+    print(f"Page Text: {page_text}")
+    print(f"Field Hints: {field_hints}")
+    # Targeted reads must precede full-page text: otherwise a digit sequence
+    # from the MICR line can be selected before the labelled account-box read.
+    return _merge_text(field_hints, page_text)
+
+
+def _merge_text(*values):
+    """Retain the strongest available text source for a cheque page."""
+    return " ".join(value.strip() for value in values if value and value.strip())
+
+
 @router.post("/upload")
 async def upload_cheque(file: UploadFile = File(...)):
 
@@ -126,8 +158,11 @@ async def upload_cheque(file: UploadFile = File(...)):
 
     file_path = UPLOAD_DIR / f"{Path(original_name).stem}_{uuid4().hex}{extension}"
 
-    with file_path.open("wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    try:
+        with file_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    finally:
+        await file.close()
 
     size_status, size_message = ImageQuality.check_file_size(file_path)
     if not size_status:
@@ -148,8 +183,23 @@ async def upload_cheque(file: UploadFile = File(...)):
         if not image_paths:
             return _response(False, "PDF does not contain any pages", [])
 
-    detector = ChequeDetector()
-    ocr = OCRService()
+    try:
+        ocr = _get_ocr()
+    except Exception as exc:
+        return _response(False, f"Processing service unavailable: {exc}", [])
+
+    detector = None
+    if get_settings().use_cheque_detector:
+        try:
+            candidate = _get_detector()
+            if candidate.supports_cheque_detection:
+                detector = candidate
+            else:
+                print("Cheque detector is disabled because the model has no cheque class.")
+        except Exception as exc:
+            # OCR can still return all fields, so a detector issue must not
+            # turn an otherwise processable cheque into a failed request.
+            print(f"Cheque detector unavailable; continuing with OCR: {exc}")
 
     cheque_results = []
 
@@ -167,7 +217,7 @@ async def upload_cheque(file: UploadFile = File(...)):
         brightness_status, _ = ImageQuality.check_brightness(image)
 
         if not (resolution_status and blur_status and brightness_status):
-            ocr_text = _get_page_text(image_path, pdf_texts, page_index, ocr)
+            ocr_text = _get_cheque_text(image_path, pdf_texts, page_index, ocr)
             # print(f"Page {page_index}: OCR Text: {ocr_text}")
             fields = _extract_fields(ocr_text)
             signature_status, _ = SignatureChecker.check_signature(image)
@@ -178,7 +228,7 @@ async def upload_cheque(file: UploadFile = File(...)):
             )
             continue
 
-        detections = detector.detect(str(image_path))
+        detections = detector.detect(str(image_path)) if detector else []
         cheques = [
             d for d in detections
             if d["class"].lower() == "cheque"
@@ -201,7 +251,11 @@ async def upload_cheque(file: UploadFile = File(...)):
                 ocr_raw_result = ocr.read_text(crop_path)
                 ocr_text, _ = ocr.extract_text(ocr_raw_result)
 
-                fields = _extract_fields(ocr_text)
+                # A detector crop is useful for image-only PDFs, but OCR can
+                # lose edge fields such as the MICR line.  Include the page's
+                # embedded text (when present) before parsing the cheque.
+                page_text = _get_cheque_text(image_path, pdf_texts, page_index, ocr)
+                fields = _extract_fields(_merge_text(ocr_text, page_text))
                 crop_image = cv2.imread(crop_path)
                 signature_status, _ = SignatureChecker.check_signature(crop_image)
                 validations = _validate_fields(fields, signature_status)
@@ -211,7 +265,7 @@ async def upload_cheque(file: UploadFile = File(...)):
                 )
         else:
             # Fallback: when no cheque box is detected, OCR the full page and attempt to extract fields.
-            ocr_text = _get_page_text(image_path, pdf_texts, page_index, ocr)
+            ocr_text = _get_cheque_text(image_path, pdf_texts, page_index, ocr)
             fields = _extract_fields(ocr_text)
             signature_status, _ = SignatureChecker.check_signature(image)
             validations = _validate_fields(fields, signature_status)

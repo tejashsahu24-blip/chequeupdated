@@ -7,6 +7,10 @@ def _csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class Settings:
     """Application settings loaded from environment variables."""
 
@@ -21,6 +25,10 @@ class Settings:
     max_pdf_size_mb: float = float(os.getenv("MAX_PDF_SIZE_MB", "25"))
     pdf_dpi: int = int(os.getenv("PDF_DPI", "300"))
     yolo_confidence_threshold: float = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.40"))
+    # Full-page OCR is both faster and more dependable with the bundled
+    # general-purpose yolov8n model. Enable this only when YOLO_MODEL_PATH
+    # points to a model trained with a class named "cheque".
+    use_cheque_detector: bool = _bool(os.getenv("USE_CHEQUE_DETECTOR", "false"))
     ocr_confidence_threshold: float = float(os.getenv("OCR_CONFIDENCE_THRESHOLD", "0.70"))
 
     required_fields: list[str] = _csv(os.getenv("REQUIRED_FIELDS", ""))

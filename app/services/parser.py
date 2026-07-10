@@ -43,21 +43,21 @@ class Parser:
 
     @staticmethod
     def clean_cheque_number(number):
-
-        number = Parser.clean_text(number)
-
-        number = number.replace(" ", "")
-
-        return number
+        return Parser._clean_numeric(number)
 
     @staticmethod
     def clean_cts(cts):
+        return Parser._clean_numeric(cts)
 
-        cts = Parser.clean_text(cts)
-
-        cts = cts.replace(" ", "")
-
-        return cts
+    @staticmethod
+    def _clean_numeric(value):
+        """Normalise common OCR substitutions in printed cheque numbers."""
+        value = Parser.clean_text(value).upper()
+        value = value.translate(str.maketrans({
+            "O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
+            "Z": "2", "S": "5", "B": "8", "G": "6",
+        }))
+        return re.sub(r"[^0-9]", "", value)
 
     @staticmethod
     def clean_name(name):
@@ -83,7 +83,8 @@ class Parser:
         "ACCOUNT", "PAYEE", "BEARER", "NOT", "NEGOTIABLE", "CHEQUE",
         "BRANCH", "DATE", "SIGN", "SIGNATURE", "VALID", "MONTHS", "OR",
         "AND", "FOR", "NO", "CTS", "MICR", "A", "C", "PLEASE", "ABOVE",
-        "CROSSING", "LINES", "WITHIN"
+        "CROSSING", "LINES", "WITHIN", "PAYABLE", "AT", "PAR", "ANY",
+        "OF", "THE", "BRANCHES", "DELIGHT"
     }
 
     @staticmethod
@@ -98,6 +99,18 @@ class Parser:
         """
 
         cleaned_text = Parser.clean_text(text).upper()
+
+        # OCR often inserts spaces or punctuation inside an IFSC code, e.g.
+        # ``SBIN 0 012345``.  Search a compact view as well as individual
+        # tokens, but require an IFSC/account context so ordinary words cannot
+        # be joined accidentally.
+        for match in re.finditer(
+            r"IFSC\s*(?:CODE)?\s*[:#-]?\s*([A-Z]{4}\s*[0O](?:\s*[A-Z0-9]){6})",
+            cleaned_text,
+        ):
+            candidate = Parser.clean_ifsc(match.group(1))
+            if re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", candidate):
+                return candidate
 
         for token in re.split(r"\s+", cleaned_text):
             candidate = re.sub(r"[^A-Z0-9]", "", token)
@@ -119,7 +132,7 @@ class Parser:
         cleaned_text = Parser.clean_text(text)
 
         keyword_match = re.search(
-            r"(?:a/c|account|acc(?:ount)?)(?:\s*no|\s*number|\s*#)?[:\s-]{0,10}(\d[\d\s-]{7,20}\d)",
+            r"(?:a/c|account|acc(?:ount)?)(?:\s*(?:no|number|#|\.))?\s*[:\-]?\s*(\d[\d\s-]{7,20}\d)",
             cleaned_text,
             re.IGNORECASE
         )
@@ -151,14 +164,14 @@ class Parser:
         cleaned_text = Parser.clean_text(text)
 
         keyword_match = re.search(
-            r"(?:cheque|check|chq)(?:\s*(?:no|number)?)[^\d]*(\d[\d\s-]{3,7}\d)",
+            r"(?:cheque|check|chq)(?:\s*(?:no|number)?)[^0-9OQDILZSBG]*([0-9OQDILZSBG][0-9OQDILZSBG\s-]{3,8}[0-9OQDILZSBG])",
             cleaned_text,
             re.IGNORECASE
         )
 
         if keyword_match:
             candidate = Parser.clean_cheque_number(keyword_match.group(1))
-            if 4 <= len(candidate) <= 8:
+            if 5 <= len(candidate) <= 8:
                 return candidate
 
         matches = re.findall(r"\b\d{6}\b", cleaned_text)
@@ -174,6 +187,23 @@ class Parser:
 
         cleaned_text = Parser.clean_text(text)
 
+        # Some cheque leaves expose the official CTS compliance mark instead
+        # of a separate MICR/CTS number.
+        cts_mark = re.search(r"\bCTS\s*[- ]?\s*20\d{2}\b", cleaned_text, re.IGNORECASE)
+
+        keyword_match = re.search(
+            r"(?:CTS|MICR)(?:\s*(?:NO|NUMBER|CODE))?\s*[:#-]?\s*(\d[\d\s-]{7,12}\d)",
+            cleaned_text,
+            re.IGNORECASE,
+        )
+        if keyword_match:
+            candidate = Parser.clean_cts(keyword_match.group(1))
+            if len(candidate) == 9 and candidate.isdigit():
+                return candidate
+
+        if cts_mark:
+            return cts_mark.group(0).upper().replace(" ", "-")
+
         matches = re.findall(r"\b\d{9}\b", cleaned_text)
 
         account_number = Parser.extract_account_number(cleaned_text)
@@ -186,9 +216,32 @@ class Parser:
 
     @staticmethod
     def extract_customer_name(text):
-        """Find the longest run of non bank-related words to use as the customer name."""
+        """Extract the payee/customer name without accepting bank boilerplate."""
 
         cleaned_text = Parser.clean_text(text)
+
+        # Prefer an explicitly labelled account-holder/customer name.  It is
+        # substantially more reliable than choosing the longest OCR phrase on
+        # a cheque, which is frequently bank boilerplate.
+        labelled_name = re.search(
+            r"(?:customer|account\s*holder|account)\s*name\s*[:#-]?\s*([A-Za-z][A-Za-z .]{2,100}?)(?=\s+(?:RUPEES|OR\s+BEARER|BEARER|A/C|ACCOUNT|CBS)\b|$)",
+            cleaned_text,
+            re.IGNORECASE,
+        )
+        if labelled_name:
+            candidate = Parser._valid_name_candidate(labelled_name.group(1))
+            if candidate:
+                return candidate
+
+        payee_name = re.search(
+            r"\bPAY\s*[:#-]?\s*([A-Za-z][A-Za-z .]{2,100}?)(?=\s+(?:RUPEES|OR\s+BEARER|BEARER)\b|$)",
+            cleaned_text,
+            re.IGNORECASE,
+        )
+        if payee_name:
+            candidate = Parser._valid_name_candidate(payee_name.group(1))
+            if candidate:
+                return candidate
 
         words = re.findall(r"[A-Za-z]+", cleaned_text)
 
@@ -210,7 +263,29 @@ class Parser:
         if not best_phrase and current_phrase:
             best_phrase = current_phrase
 
-        return " ".join(best_phrase).upper()
+        return Parser._valid_name_candidate(" ".join(best_phrase))
+
+    @staticmethod
+    def _valid_name_candidate(value):
+        """Return a plausible name, otherwise an empty string.
+
+        This prevents noisy OCR or printed bank copy from making a cheque
+        appear valid merely because it contains alphabetic characters.
+        """
+        name = Parser.clean_name(value)
+        # Discard isolated OCR specks (for example, a stray ``H`` next to a
+        # handwritten payee) rather than throwing away the entire name.
+        words = [
+            word for word in name.split()
+            if word not in Parser._NAME_STOPWORDS and len(word) >= 2
+        ]
+        if not 2 <= len(words) <= 10:
+            return ""
+        if sum(len(word) for word in words) < 5:
+            return ""
+        if sum(len(word) for word in words) / len(words) < 3:
+            return ""
+        return " ".join(words)
 
     @staticmethod
     def extract_fields(text):

@@ -21,8 +21,14 @@ class ChequeDetector:
 
         self.model = YOLO(str(model_path))
         self.confidence_threshold = settings.yolo_confidence_threshold
+        class_names = self.model.names.values() if isinstance(self.model.names, dict) else self.model.names
+        self.supports_cheque_detection = any(
+            str(name).strip().lower() == "cheque" for name in class_names
+        )
 
         print(f"Model Loaded Successfully: {model_path}")
+        if not self.supports_cheque_detection:
+            print("YOLO model has no 'cheque' class; using full-page OCR fallback.")
 
     def detect(self, image_path):
         results = self.model.predict(

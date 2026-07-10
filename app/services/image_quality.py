@@ -22,11 +22,15 @@ class ImageQuality:
 
         size_mb = size / (1024 * 1024)
 
-        if size_mb > 10:
+        if size_mb > 25:
             return False, "Image Size Too Large"
 
-        if size_mb < 0.05:
-            return False, "Image Size Too Small"
+        # Small scanned images are still processable: the OCR path upscales
+        # them and the quality checks decide whether values can be trusted.
+        # Reject only an actually empty upload, rather than discarding a
+        # useful cheque before extraction is attempted.
+        if size <= 0:
+            return False, "Uploaded file is empty"
 
         return True, "File Size OK"
 

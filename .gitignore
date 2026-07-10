@@ -1,0 +1,2 @@
+# Runtime PaddleOCR cache. Models are downloaded automatically on first use.
+app/models/paddle/
