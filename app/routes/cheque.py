@@ -112,29 +112,34 @@ def _build_cheque_result(fields, validations, signature_status):
 
 
 def _get_page_text(image_path, pdf_texts, page_index, ocr):
-    # print(f"Page {page_index}: Extracting text from image: {image_path} and PDF texts: {pdf_texts} and page index: {page_index} and ocr: {ocr}")
-    if pdf_texts and page_index - 1 < len(pdf_texts) and pdf_texts[page_index - 1]:
-        return pdf_texts[page_index - 1]
-
     ocr_raw_result = ocr.read_text(str(image_path))
-    # print(f"Page {page_index}: OCR Raw Result: {ocr_raw_result}")
     ocr_text, _ = ocr.extract_text(ocr_raw_result)
 
-    if not ocr_text and pdf_texts and page_index - 1 < len(pdf_texts):
-        return pdf_texts[page_index - 1]
+    # A PDF can contain an incomplete text layer while its rendered page has
+    # readable cheque fields (and vice versa).  Keep both sources for every
+    # page instead of skipping OCR whenever any embedded PDF text exists.
+    pdf_text = ""
+    if pdf_texts and page_index - 1 < len(pdf_texts):
+        pdf_text = pdf_texts[page_index - 1]
 
-    return ocr_text
+    return _merge_text(pdf_text, ocr_text)
 
 
 def _get_cheque_text(image_path, pdf_texts, page_index, ocr):
     """Combine page OCR/PDF text with targeted CTS and serial-number reads."""
     page_text = _get_page_text(image_path, pdf_texts, page_index, ocr)
     field_hints = ocr.read_cheque_field_hints(str(image_path))
-    print(f"Page Text: {page_text}")
-    print(f"Field Hints: {field_hints}")
     # Targeted reads must precede full-page text: otherwise a digit sequence
     # from the MICR line can be selected before the labelled account-box read.
     return _merge_text(field_hints, page_text)
+
+
+def _get_cached_cheque_text(image_path, pdf_texts, page_index, ocr, cache):
+    """Read a page once and reuse the result for every cheque crop on it."""
+    cache_key = (str(image_path), page_index)
+    if cache_key not in cache:
+        cache[cache_key] = _get_cheque_text(image_path, pdf_texts, page_index, ocr)
+    return cache[cache_key]
 
 
 def _merge_text(*values):
@@ -202,6 +207,7 @@ async def upload_cheque(file: UploadFile = File(...)):
             print(f"Cheque detector unavailable; continuing with OCR: {exc}")
 
     cheque_results = []
+    page_text_cache = {}
 
     for page_index, image_path in enumerate(image_paths, start=1):
         image = cv2.imread(str(image_path))
@@ -217,7 +223,7 @@ async def upload_cheque(file: UploadFile = File(...)):
         brightness_status, _ = ImageQuality.check_brightness(image)
 
         if not (resolution_status and blur_status and brightness_status):
-            ocr_text = _get_cheque_text(image_path, pdf_texts, page_index, ocr)
+            ocr_text = _get_cached_cheque_text(image_path, pdf_texts, page_index, ocr, page_text_cache)
             # print(f"Page {page_index}: OCR Text: {ocr_text}")
             fields = _extract_fields(ocr_text)
             signature_status, _ = SignatureChecker.check_signature(image)
@@ -233,6 +239,8 @@ async def upload_cheque(file: UploadFile = File(...)):
             d for d in detections
             if d["class"].lower() == "cheque"
         ]
+
+        page_text = _get_cached_cheque_text(image_path, pdf_texts, page_index, ocr, page_text_cache)
 
         if cheques:
             cropped_images = Cropper.crop_fields(
@@ -254,7 +262,6 @@ async def upload_cheque(file: UploadFile = File(...)):
                 # A detector crop is useful for image-only PDFs, but OCR can
                 # lose edge fields such as the MICR line.  Include the page's
                 # embedded text (when present) before parsing the cheque.
-                page_text = _get_cheque_text(image_path, pdf_texts, page_index, ocr)
                 fields = _extract_fields(_merge_text(ocr_text, page_text))
                 crop_image = cv2.imread(crop_path)
                 signature_status, _ = SignatureChecker.check_signature(crop_image)
@@ -265,8 +272,7 @@ async def upload_cheque(file: UploadFile = File(...)):
                 )
         else:
             # Fallback: when no cheque box is detected, OCR the full page and attempt to extract fields.
-            ocr_text = _get_cheque_text(image_path, pdf_texts, page_index, ocr)
-            fields = _extract_fields(ocr_text)
+            fields = _extract_fields(page_text)
             signature_status, _ = SignatureChecker.check_signature(image)
             validations = _validate_fields(fields, signature_status)
 

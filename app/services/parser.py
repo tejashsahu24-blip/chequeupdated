@@ -163,20 +163,39 @@ class Parser:
 
         cleaned_text = Parser.clean_text(text)
 
+        micr_match = re.search(
+            r"\bMICR(?:\s*(?:CHEQUE|CHQ))?(?:\s*(?:NO|NUMBER|GROUP|LINE))?\s*[:#-]?\s*((?:\d[\s-]*){5,8})",
+            cleaned_text,
+            re.IGNORECASE,
+        )
+        if micr_match:
+            candidate = Parser.clean_cheque_number(micr_match.group(1))
+            if 5 <= len(candidate) <= 8:
+                return candidate
+
         keyword_match = re.search(
             r"(?:cheque|check|chq)(?:\s*(?:no|number)?)[^0-9OQDILZSBG]*([0-9OQDILZSBG][0-9OQDILZSBG\s-]{3,8}[0-9OQDILZSBG])",
             cleaned_text,
             re.IGNORECASE
         )
 
+        matches = re.findall(r"\b\d{6}\b", cleaned_text)
+        if matches:
+            return matches[0]
+
+        spaced_matches = []
+        for match in re.finditer(r"(?:\b\d\b[\s-]*){6}", cleaned_text):
+            candidate = re.sub(r"[^0-9]", "", match.group(0))
+            if len(candidate) == 6:
+                spaced_matches.append(candidate)
+
+        if spaced_matches:
+            return spaced_matches[0]
+
         if keyword_match:
             candidate = Parser.clean_cheque_number(keyword_match.group(1))
             if 5 <= len(candidate) <= 8:
                 return candidate
-
-        matches = re.findall(r"\b\d{6}\b", cleaned_text)
-        if matches:
-            return matches[0]
 
         matches = re.findall(r"\b\d{5,8}\b", cleaned_text)
         return matches[0] if matches else ""
@@ -219,6 +238,21 @@ class Parser:
         """Extract the payee/customer name without accepting bank boilerplate."""
 
         cleaned_text = Parser.clean_text(text)
+
+        # Account-holder names on Indian cheques are often printed with an
+        # honorific (for example ``Mr. SANTOSH KUMAR YADU``).  Prefer this
+        # highly specific pattern before looking at OCR-generated field
+        # hints: a hint such as ``Customer Name: as i? fe`` can otherwise
+        # consume the following real name after whitespace is normalised.
+        titled_name = re.search(
+            r"\b(?:mr|mrs|ms)\s*\.?\s*([A-Za-z]{2,}(?:\s+[A-Za-z]{2,}){1,5}?)(?=\s+(?:PLEASE|SIGN|FIELD|HINTS|RUPEES|OR\s+BEARER|BEARER|A/C|ACCOUNT|CBS)\b|$)",
+            cleaned_text,
+            re.IGNORECASE,
+        )
+        if titled_name:
+            candidate = Parser._valid_name_candidate(titled_name.group(1))
+            if candidate:
+                return candidate
 
         # Prefer an explicitly labelled account-holder/customer name.  It is
         # substantially more reliable than choosing the longest OCR phrase on

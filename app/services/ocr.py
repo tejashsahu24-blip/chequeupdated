@@ -134,6 +134,49 @@ class OCRService:
 
         return ImageOps.autocontrast(image)
 
+    def _orient_image_for_cheque_fields(self, image):
+        """Return the rotation that is most likely to be an upright cheque.
+
+        ``read_text`` already checks all four rotations.  The targeted field
+        reader must do the same before using fixed cheque coordinates;
+        otherwise an upright crop from a portrait PDF is actually a vertical
+        slice through unrelated text.
+        """
+        best_image = image
+        best_score = -1
+
+        for angle in (0, 90, 180, 270):
+            rotated = image.rotate(angle, expand=True) if angle else image
+            try:
+                text = self.pytesseract.image_to_string(
+                    self._preprocess_pil_image(rotated), config="--psm 11"
+                )
+            except Exception:
+                continue
+
+            score = self._score_orientation(text)
+            if score > best_score:
+                best_score = score
+                best_image = rotated
+
+        return best_image
+
+    @staticmethod
+    def _numeric_sequences(text, min_len=5, max_len=8):
+        candidates = []
+        seen = set()
+
+        for length in range(max_len, min_len - 1, -1):
+            pattern = rf"(?<!\d)(\d(?:[\s-]*\d){{{length - 1}}})(?!\d)"
+            for match in re.finditer(pattern, text):
+                candidate = re.sub(r"[^0-9]", "", match.group(1))
+                if len(candidate) != length or candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidates.append(candidate)
+
+        return candidates
+
     def read_text(self, image_path: str):
         if self.backend == "pytesseract":
             return self._read_text_tesseract(image_path)
@@ -175,11 +218,8 @@ class OCRService:
                 if score > best_score:
                     best_score = score
                     best_text = text
-
-                # A field-shaped read plus cheque context is a reliable
-                # result; no further rotations are needed.
-                if score >= self._CONFIDENT_KEYWORD_HITS + 3:
-                    return [[[None, [text, 0.0]]]]
+                    if best_score >= self._CONFIDENT_KEYWORD_HITS + 3:
+                        return [[[None, [best_text, 0.0]]]]
 
         return [[[None, [best_text, 0.0]]]]
 
@@ -233,17 +273,35 @@ class OCRService:
             if width < 100 or height < 100:
                 return ""
 
-            # Serial number is normally in the left portion of the MICR line.
-            serial_region = image.crop((
-                int(width * 0.14), int(height * 0.76),
-                int(width * 0.48), int(height * 1.00),
-            ))
-            serial_region = self._preprocess_pil_image(serial_region)
-            # serial_region.save("serial_region.png")  # Save the serial region for debugging
-            serial_text = self.pytesseract.image_to_string(
-                serial_region,
-                config="--psm 7 -c tessedit_char_whitelist=0123456789OQDILZSBG",
-            )
+            image = self._orient_image_for_cheque_fields(image)
+            width, height = image.size
+
+            # The MICR serial is printed along the bottom edge.  Read a few
+            # overlapping bottom strips so a narrow crop or a slightly skewed
+            # page does not hide the cheque number.
+            serial_regions = [
+                image.crop((
+                    int(width * 0.05), int(height * 0.82),
+                    int(width * 0.45), int(height * 0.99),
+                )),
+                image.crop((
+                    int(width * 0.00), int(height * 0.84),
+                    int(width * 0.98), int(height * 1.00),
+                )),
+            ]
+            serial_candidates = []
+            for serial_region in serial_regions:
+                serial_region = self._preprocess_pil_image(serial_region)
+                for config in (
+                    "--psm 7 -c tessedit_char_whitelist=0123456789OQDILZSBG",
+                    "--psm 6 -c tessedit_char_whitelist=0123456789OQDILZSBG",
+                ):
+                    serial_text = self.pytesseract.image_to_string(
+                        serial_region,
+                        config=config,
+                    )
+                    serial_candidates.extend(self._numeric_sequences(serial_text, 6, 6))
+                    serial_candidates.extend(self._numeric_sequences(serial_text, 5, 8))
 
             # CTS-2010 is commonly printed vertically on the left border.
             cts_region = image.crop((
@@ -258,13 +316,10 @@ class OCRService:
             # On the MICR line the cheque serial is the first six digits. OCR
             # commonly reads the adjacent MICR separator as letters, so
             # normalise those symbols before taking that serial component.
-            serial_digits = serial_text.upper().translate(str.maketrans({
-                "O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
-                "Z": "2", "S": "5", "B": "8", "G": "6",
-            }))
-            serial_digits = re.sub(r"[^0-9]", "", serial_digits)
-            if len(serial_digits) >= 6:
-                hints.append(f"Cheque No: {serial_digits[:6]}")
+            if serial_candidates:
+                six_digit = next((candidate for candidate in serial_candidates if len(candidate) == 6), "")
+                serial_digits = six_digit or serial_candidates[0]
+                hints.append(f"MICR Cheque No: {serial_digits}")
 
             cts_text = " ".join(cts_texts).upper()
             # Rotated OCR can read CTS as SLO/SIO and 2010 backwards as 0102.
@@ -307,12 +362,9 @@ class OCRService:
                 int(width * 0.75), int(height * 0.50),
                 int(width), int(height),
             ))
-            payee_region.save("payee_region.png")
-
             payee_text = self.pytesseract.image_to_string(
                 self._preprocess_pil_image(payee_region), config="--psm 6"
             )
-            print("Payee OCR result:", payee_text)  # Debugging output
             if payee_text.strip():
                 hints.append(f"Customer Name: {payee_text.strip()}")
             return " ".join(hints)
