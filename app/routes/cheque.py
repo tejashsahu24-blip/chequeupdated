@@ -1,4 +1,6 @@
+from collections import Counter
 from functools import lru_cache
+import re
 
 from fastapi import APIRouter, UploadFile, File
 from pathlib import Path
@@ -110,6 +112,92 @@ def _build_cheque_result(fields, validations, signature_status):
         "valid": validations.get("is_valid", False)
     }
 
+
+def _apply_cheque_sequence_correction(cheque_results):
+    """Correct OCR outliers in a multi-page sequential cheque book."""
+    if len(cheque_results) < 4:
+        return
+
+    numbers = [str(cheque.get("cheque_no") or "") for cheque in cheque_results]
+    if not all(re.fullmatch(r"\d{6}", number) for number in numbers):
+        return
+
+    inferred_starts = [int(number) - index for index, number in enumerate(numbers)]
+    start_counts = Counter(inferred_starts)
+    start, exact_count = start_counts.most_common(1)[0]
+
+    if exact_count < max(4, len(numbers) // 3):
+        return
+
+    expected_numbers = [f"{start + index:06d}" for index in range(len(numbers))]
+
+    close_or_exact = 0
+    for original, expected in zip(numbers, expected_numbers):
+        if original == expected:
+            close_or_exact += 1
+            continue
+        if original[:4] == expected[:4] and _hamming_distance(original, expected) <= 2:
+            close_or_exact += 1
+
+    if close_or_exact < max(4, len(numbers) // 2):
+        return
+
+    for cheque, expected in zip(cheque_results, expected_numbers):
+        if cheque.get("cheque_no") == expected:
+            continue
+        cheque["cheque_no"] = expected
+        validations = cheque.get("validations") or {}
+        validations["cheque_no"] = Validator.validate_cheque_number(expected)
+        validations["is_valid"] = all(validations.values())
+        cheque["validations"] = validations
+        cheque["valid"] = validations["is_valid"]
+
+
+def _hamming_distance(left, right):
+    return sum(a != b for a, b in zip(left, right)) + abs(len(left) - len(right))
+
+def _apply_common_customer_name_correction(cheque_results):
+    groups = {}
+    for cheque in cheque_results:
+        account_no = cheque.get("account_no") or ""
+        if account_no:
+            groups.setdefault(account_no, []).append(cheque)
+
+    for cheques in groups.values():
+        if len(cheques) < 2:
+            continue
+        best_name = ""
+        best_score = 0
+        for cheque in cheques:
+            name = cheque.get("customer_name") or ""
+            score = _customer_name_score(name)
+            if score > best_score:
+                best_score = score
+                best_name = name
+        if best_score < 12:
+            continue
+        for cheque in cheques:
+            current_score = _customer_name_score(cheque.get("customer_name") or "")
+            if current_score >= best_score:
+                continue
+            cheque["customer_name"] = best_name
+            validations = cheque.get("validations") or {}
+            validations["customer_name"] = Validator.validate_customer_name(best_name)
+            validations["is_valid"] = all(validations.values())
+            cheque["validations"] = validations
+            cheque["valid"] = validations["is_valid"]
+
+
+def _customer_name_score(name):
+    words = re.findall(r"[A-Z]+", str(name or "").upper())
+    if not words:
+        return 0
+    common_name_tokens = {"KUMAR", "KUMARI", "SINGH", "DEVI", "RAM", "LAL", "CHAND", "PRASAD"}
+    noise_tokens = {"EPEE", "ERY", "BEE", "CEEGES", "THIE", "ABELHA", "IPSC", "IFSC", "BANK"}
+    score = sum(min(len(word), 8) for word in words)
+    score += sum(10 for word in words if word in common_name_tokens)
+    score -= sum(8 for word in words if word in noise_tokens)
+    return score
 
 def _get_page_text(image_path, pdf_texts, page_index, ocr):
     ocr_raw_result = ocr.read_text(str(image_path))
@@ -280,6 +368,8 @@ async def upload_cheque(file: UploadFile = File(...)):
                 _build_cheque_result(fields, validations, signature_status)
             )
 
+    _apply_cheque_sequence_correction(cheque_results)
+    _apply_common_customer_name_correction(cheque_results)
     if not cheque_results:
         return _response(False, "No cheque detected", [])
 

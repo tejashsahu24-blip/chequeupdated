@@ -1,5 +1,7 @@
+import json
 import os
 import re
+import subprocess
 from collections import Counter
 from pathlib import Path
 from PIL import Image, ImageOps
@@ -207,6 +209,79 @@ class OCRService:
         # independent preprocessing/segmentation passes must agree.
         return selected if counts[selected] >= 2 else ""
 
+    @staticmethod
+    def _sdk_micr_serial_from_text(text):
+        """Return the first six digits from an SDK-recognized MICR line."""
+        digits = re.sub(r"[^0-9]", "", text or "")
+        return digits[:6] if len(digits) >= 6 else ""
+
+    @classmethod
+    def _sdk_micr_serial_from_payload(cls, payload):
+        zones = payload.get("zones") if isinstance(payload, dict) else None
+        if not isinstance(zones, list):
+            return ""
+
+        zone_texts = []
+        for zone in zones:
+            if not isinstance(zone, dict):
+                continue
+            zone_text = zone.get("text")
+            if zone_text:
+                zone_texts.append(str(zone_text))
+
+        # The recognizer normally returns the complete MICR row as one zone.
+        # If several zones are returned, joining them keeps the left-to-right
+        # first six digits while still ignoring routing/account later blocks.
+        return cls._sdk_micr_serial_from_text(" ".join(zone_texts))
+
+    def _read_ultimate_micr_serial(self, image_path):
+        recognizer_from_env = os.getenv("ULTIMATE_MICR_RECOGNIZER")
+        sdk_root = Path(__file__).resolve().parents[2] / "third_party" / "ultimateMICR-SDK"
+        recognizer = (
+            Path(recognizer_from_env)
+            if recognizer_from_env
+            else sdk_root / "binaries" / "windows" / "x86_64" / "recognizer.exe"
+        )
+        assets = sdk_root / "assets"
+
+        if not recognizer.exists() or not assets.exists():
+            return ""
+
+        try:
+            completed = subprocess.run(
+                [
+                    str(recognizer),
+                    "--image", str(image_path),
+                    "--format", "e13b",
+                    "--assets", str(assets),
+                ],
+                cwd=str(recognizer.parent),
+                input="`n",
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except Exception as exc:
+            print("ultimateMICR recognizer failed:", exc)
+            return ""
+
+        output = f"{completed.stdout}\n{completed.stderr}"
+        for line in output.splitlines():
+            line = line.strip()
+            if "result:" not in line:
+                continue
+            try:
+                payload = json.loads(line.split("result:", 1)[1].strip())
+            except json.JSONDecodeError:
+                continue
+            serial = self._sdk_micr_serial_from_payload(payload)
+            if serial:
+                return serial
+
+        if completed.returncode != 0:
+            print("ultimateMICR recognizer exited with code:", completed.returncode)
+        return ""
     def _micr_preprocess_variants(self, region):
         """Create threshold variants that preserve thin E-13B MICR strokes."""
         base = self._preprocess_pil_image(region)
@@ -318,8 +393,6 @@ class OCRService:
                 if score > best_score:
                     best_score = score
                     best_text = text
-                    if best_score >= self._CONFIDENT_KEYWORD_HITS + 3:
-                        return [[[None, [best_text, 0.0]]]]
 
         return [[[None, [best_text, 0.0]]]]
 
@@ -429,6 +502,10 @@ class OCRService:
                 cts_texts.append(self.pytesseract.image_to_string(rotated, config="--psm 6"))
 
             hints = []
+            sdk_serial = self._read_ultimate_micr_serial(image_path)
+            if sdk_serial:
+                hints.append(f"MICR Cheque No: {sdk_serial}")
+
             # On the MICR line the cheque serial is the first six digits. OCR
             # commonly reads the adjacent MICR separator as letters, so
             # normalise those symbols before taking that serial component.
@@ -436,12 +513,13 @@ class OCRService:
             # verified consensus.  Broad fallback bands are used only when
             # necessary, so unrelated lower-page text cannot outvote it.
             serial = ""
-            for serial_region in detected_serial_regions + fallback_serial_regions:
-                serial = self._select_micr_serial(read_serial_candidates(serial_region))
+            if not sdk_serial:
+                for serial_region in detected_serial_regions + fallback_serial_regions:
+                    serial = self._select_micr_serial(read_serial_candidates(serial_region))
+                    if serial:
+                        break
                 if serial:
-                    break
-            if serial:
-                hints.append(f"MICR Cheque No: {serial}")
+                    hints.append(f"MICR Cheque No: {serial}")
 
             cts_text = " ".join(cts_texts).upper()
             # Rotated OCR can read CTS as SLO/SIO and 2010 backwards as 0102.

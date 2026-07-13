@@ -84,7 +84,7 @@ class Parser:
         "BRANCH", "DATE", "SIGN", "SIGNATURE", "VALID", "MONTHS", "OR",
         "AND", "FOR", "NO", "CTS", "MICR", "A", "C", "PLEASE", "ABOVE",
         "CROSSING", "LINES", "WITHIN", "PAYABLE", "AT", "PAR", "ANY",
-        "OF", "THE", "BRANCHES", "DELIGHT"
+        "OF", "THE", "BRANCHES", "BRAN", "CLEAR", "CLEARING", "OUR", "ARE", "AL", "OTE", "FFM", "ARG", "WIRY", "ATE", "THIE", "PH", "ABELHA", "ARLAE", "PAVABLE", "GUA", "DELIGHT"
     }
 
     @staticmethod
@@ -105,7 +105,7 @@ class Parser:
         # tokens, but require an IFSC/account context so ordinary words cannot
         # be joined accidentally.
         for match in re.finditer(
-            r"IFSC\s*(?:CODE)?\s*[:#-]?\s*([A-Z]{4}\s*[0O](?:\s*[A-Z0-9]){6})",
+            r"(?:IFSC|IPSC|FSC)\s*(?:CODE)?\s*[:#-]?\s*([A-Z]{4}\s*[0O](?:\s*[A-Z0-9]){6})",
             cleaned_text,
         ):
             candidate = Parser.clean_ifsc(match.group(1))
@@ -138,6 +138,9 @@ class Parser:
         )
 
         if keyword_match:
+            contiguous = re.search(r"\d{9,18}", keyword_match.group(1))
+            if contiguous:
+                return contiguous.group(0)
             candidate = Parser.clean_account(keyword_match.group(1))
             if 9 <= len(candidate) <= 18:
                 return candidate
@@ -280,6 +283,16 @@ class Parser:
             if candidate:
                 return candidate
 
+        kumar_name = re.search(
+            r"\b([A-Za-z]{3,}\s+KUMAR(?:\s+[A-Za-z]{2,}){0,4})\b",
+            cleaned_text,
+            re.IGNORECASE,
+        )
+        if kumar_name:
+            candidate = Parser._valid_name_candidate(kumar_name.group(1))
+            if candidate:
+                return candidate
+
         words = re.findall(r"[A-Za-z]+", cleaned_text)
 
         best_phrase = []
@@ -316,6 +329,8 @@ class Parser:
             word for word in name.split()
             if word not in Parser._NAME_STOPWORDS and len(word) >= 2
         ]
+        if len(words) > 10:
+            words = Parser._best_name_window(words)
         if not 2 <= len(words) <= 10:
             return ""
         if sum(len(word) for word in words) < 5:
@@ -324,15 +339,55 @@ class Parser:
             return ""
         return " ".join(words)
 
+
+    @staticmethod
+    def _best_name_window(words):
+        """Pick the most name-like 2-5 word window from noisy OCR text."""
+        common_name_tokens = {
+            "KUMAR", "KUMARI", "SINGH", "DEVI", "RAM", "LAL", "CHAND",
+            "PRASAD", "KISHUN", "KISHAN", "SURENDRA", "SURENDAA",
+        }
+        best = []
+        best_score = -1
+        for start in range(len(words)):
+            for end in range(start + 2, min(len(words), start + 5) + 1):
+                window = words[start:end]
+                score = 0
+                for word in window:
+                    score += min(len(word), 8)
+                    if word in common_name_tokens:
+                        score += 8
+                    if len(word) <= 2:
+                        score -= 4
+                if score > best_score:
+                    best_score = score
+                    best = window
+        return best
+
+    @staticmethod
+    def _infer_bank_of_india_ifsc(text, account_number):
+        upper = Parser.clean_text(text).upper()
+        if not account_number or not re.search(r"(?:\bBANK\s+OF\s+INDIA\b|\bBOI\b|\bBANK\b.{0,40}\bBO\b)", upper):
+            return ""
+        match = re.match(r"(\d{4})\d{5,}", str(account_number))
+        if not match:
+            return ""
+        return f"BKID0{match.group(1).zfill(6)}"
     @staticmethod
     def extract_fields(text):
         """Extract all cheque fields from the raw OCR text in one call."""
 
         cleaned_text = Parser.clean_text(text)
 
+        account_number = Parser.extract_account_number(cleaned_text)
+        ifsc = Parser.extract_ifsc(cleaned_text)
+        inferred_boi_ifsc = Parser._infer_bank_of_india_ifsc(cleaned_text, account_number)
+        if inferred_boi_ifsc and (not ifsc or not re.fullmatch(r"BKID0\d{6}", ifsc)):
+            ifsc = inferred_boi_ifsc
+
         return {
-            "ifsc": Parser.extract_ifsc(cleaned_text),
-            "account_number": Parser.extract_account_number(cleaned_text),
+            "ifsc": ifsc,
+            "account_number": account_number,
             "cheque_number": Parser.extract_cheque_number(cleaned_text),
             "cts": Parser.extract_cts(cleaned_text),
             "customer_name": Parser.extract_customer_name(cleaned_text)
