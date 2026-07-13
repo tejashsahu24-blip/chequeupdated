@@ -159,46 +159,49 @@ class Parser:
 
     @staticmethod
     def extract_cheque_number(text):
-        """Find a cheque number by keyword or standalone digits."""
+        """Return only the first six-digit block in a MICR line.
+
+        A cheque image contains many numeric fields.  A generic six-digit or
+        ``Cheque No`` match can therefore select an account fragment, routing
+        number, transaction code, or the trailing MICR component.  The
+        targeted OCR reader prefixes its result with ``MICR Cheque No``; for
+        raw OCR text, the value immediately following a MICR label is used.
+        In both cases this method accepts *exactly* six digits and takes the
+        first numeric block from left to right.
+        """
 
         cleaned_text = Parser.clean_text(text)
-
-        micr_match = re.search(
-            r"\bMICR(?:\s*(?:CHEQUE|CHQ))?(?:\s*(?:NO|NUMBER|GROUP|LINE))?\s*[:#-]?\s*((?:\d[\s-]*){5,8})",
-            cleaned_text,
+        micr_label = re.compile(
+            r"\bMICR(?:\s*(?:CHEQUE|CHQ))?(?:\s*(?:NO|NUMBER|GROUP|LINE))?\s*[:#-]?",
             re.IGNORECASE,
         )
-        if micr_match:
-            candidate = Parser.clean_cheque_number(micr_match.group(1))
-            if 5 <= len(candidate) <= 8:
-                return candidate
-
-        keyword_match = re.search(
-            r"(?:cheque|check|chq)(?:\s*(?:no|number)?)[^0-9OQDILZSBG]*([0-9OQDILZSBG][0-9OQDILZSBG\s-]{3,8}[0-9OQDILZSBG])",
-            cleaned_text,
-            re.IGNORECASE
+        # OCR often confuses these glyphs in the MICR font.  Treat them as
+        # digits while locating a block, then normalise the selected block.
+        micr_digit = r"[0-9OQDILZSBG]"
+        six_digit_block = re.compile(
+            rf"(?<!{micr_digit})((?:{micr_digit}[\s-]*){{6}})(?!{micr_digit})",
+            re.IGNORECASE,
         )
 
-        matches = re.findall(r"\b\d{6}\b", cleaned_text)
-        if matches:
-            return matches[0]
+        for label in micr_label.finditer(cleaned_text):
+            # Limit the search to this MICR line/field.  This prevents a
+            # later account or routing number in the full OCR text from being
+            # considered when a partial MICR read is present.
+            micr_text = cleaned_text[label.end(): label.end() + 160]
+            first_digit = re.search(micr_digit, micr_text, re.IGNORECASE)
+            if not first_digit:
+                continue
 
-        spaced_matches = []
-        for match in re.finditer(r"(?:\b\d\b[\s-]*){6}", cleaned_text):
-            candidate = re.sub(r"[^0-9]", "", match.group(0))
-            if len(candidate) == 6:
-                spaced_matches.append(candidate)
+            # Match only at the first MICR numeric block.  Searching forward
+            # after a failed match could incorrectly return the routing or
+            # final MICR block.
+            match = six_digit_block.match(micr_text, first_digit.start())
+            if match:
+                candidate = Parser.clean_cheque_number(match.group(1))
+                if len(candidate) == 6:
+                    return candidate
 
-        if spaced_matches:
-            return spaced_matches[0]
-
-        if keyword_match:
-            candidate = Parser.clean_cheque_number(keyword_match.group(1))
-            if 5 <= len(candidate) <= 8:
-                return candidate
-
-        matches = re.findall(r"\b\d{5,8}\b", cleaned_text)
-        return matches[0] if matches else ""
+        return ""
 
     @staticmethod
     def extract_cts(text):

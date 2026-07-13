@@ -27,9 +27,10 @@ class Validator:
 
     @staticmethod
     def validate_cheque_number(number):
-        # Banks issue cheque serials with five to eight digits. OCR character
-        # substitutions are normalised by Parser before this validator runs.
-        return bool(re.fullmatch(r"\d{5,8}", str(number or "")))
+        # This API's MICR contract is explicit: the cheque serial is the
+        # first *six-digit* block.  Accepting arbitrary 5-8 digit OCR output
+        # made malformed account/routing fragments appear valid.
+        return bool(re.fullmatch(r"\d{6}", str(number or "")))
 
 
     @staticmethod

@@ -1,5 +1,6 @@
 import os
 import re
+from collections import Counter
 from pathlib import Path
 from PIL import Image, ImageOps
 
@@ -177,6 +178,105 @@ class OCRService:
 
         return candidates
 
+    @staticmethod
+    def _first_micr_serial(text):
+        """Return the left-most six MICR digits from a targeted OCR read.
+
+        Tesseract commonly reads the MICR font's ``6`` as ``B`` and its
+        ``1`` as ``L``.  This conversion is deliberately limited to the
+        lower-left MICR crop; applying it to full-page/account OCR would make
+        ordinary text and account numbers less reliable.
+        """
+        normalized = (text or "").upper().translate(str.maketrans({
+            "O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
+            "Z": "2", "S": "5", "B": "6", "G": "6",
+        }))
+        digits = re.sub(r"[^0-9]", "", normalized)
+        return digits[:6] if len(digits) >= 6 else ""
+
+    @staticmethod
+    def _select_micr_serial(candidates):
+        """Select the most consistently read six-digit MICR serial."""
+        valid = [candidate for candidate in candidates if re.fullmatch(r"\d{6}", candidate or "")]
+        if not valid:
+            return ""
+
+        counts = Counter(valid)
+        selected = max(counts, key=lambda candidate: counts[candidate])
+        # One noisy OCR result must not become an API value.  At least two
+        # independent preprocessing/segmentation passes must agree.
+        return selected if counts[selected] >= 2 else ""
+
+    def _micr_preprocess_variants(self, region):
+        """Create threshold variants that preserve thin E-13B MICR strokes."""
+        base = self._preprocess_pil_image(region)
+        return (
+            base.point(lambda pixel: 0 if pixel < 185 else 255),
+            base,
+            base.point(lambda pixel: 0 if pixel < 145 else 255),
+        )
+
+    @staticmethod
+    def _detected_micr_regions(image):
+        """Locate likely compact MICR rows in the lower cheque area.
+
+        PDF renderers and phone photos place the MICR row at different
+        vertical positions.  This uses the actual ink bands instead of a
+        bank-template coordinate and returns several bottom candidates so a
+        signature line cannot hide the MICR row.
+        """
+        width, height = image.size
+        start_y = int(height * 0.58)
+        end_y = int(height * 0.98)
+        left = int(width * 0.02)
+        # The cheque serial is the left-most MICR block.  Restricting the
+        # detected row to this side prevents the account/routing blocks from
+        # changing the character segmentation of that six-digit value.
+        right = int(width * 0.50)
+        region = image.crop((left, start_y, right, end_y))
+
+        pixels = region.load()
+        row_counts = [
+            sum(1 for x in range(region.width) if pixels[x, y] < 125)
+            for y in range(region.height)
+        ]
+        active_rows = [count > max(12, int(region.width * 0.012)) for count in row_counts]
+        groups = []
+        group_start = None
+        gap = 0
+        for index, active in enumerate(active_rows + [False]):
+            if active and group_start is None:
+                group_start = index
+                gap = 0
+            elif group_start is not None and not active:
+                gap += 1
+                # Small blank gaps occur inside a single printed text row.
+                if gap > 8:
+                    end = index - gap + 1
+                    if 12 <= end - group_start <= 140:
+                        groups.append((group_start, end))
+                    group_start = None
+                    gap = 0
+
+        if not groups:
+            return []
+
+        crops = []
+        # MICR is normally among the final compact rows.  Trying the last
+        # three works for both a blank-footer PDF and a tightly cropped photo.
+        for top, bottom in reversed(groups[-3:]):
+            # Keep generous vertical context around the glyphs.  Tight crops
+            # clip the distinctive upper/lower strokes that separate MICR 3,
+            # 5, and 7.
+            padding = max(12, int((bottom - top) * 1.0))
+            crops.append(image.crop((
+                left,
+                max(0, start_y + top - padding),
+                right,
+                min(height, start_y + bottom + padding),
+            )))
+        return crops
+
     def read_text(self, image_path: str):
         if self.backend == "pytesseract":
             return self._read_text_tesseract(image_path)
@@ -279,29 +379,45 @@ class OCRService:
             # The MICR serial is printed along the bottom edge.  Read a few
             # overlapping bottom strips so a narrow crop or a slightly skewed
             # page does not hide the cheque number.
-            serial_regions = [
+            detected_serial_regions = self._detected_micr_regions(image)
+            # Scale-relative fallback bands cover documents where low
+            # contrast prevents ink-band detection.  They do not assume any
+            # one bank's cheque layout.
+            fallback_serial_regions = [
                 image.crop((
-                    int(width * 0.05), int(height * 0.82),
-                    int(width * 0.45), int(height * 0.99),
+                    int(width * 0.02), int(height * 0.62),
+                    int(width * 0.70), int(height * 0.76),
                 )),
                 image.crop((
-                    int(width * 0.00), int(height * 0.84),
-                    int(width * 0.98), int(height * 1.00),
+                    int(width * 0.02), int(height * 0.72),
+                    int(width * 0.70), int(height * 0.86),
+                )),
+                image.crop((
+                    int(width * 0.02), int(height * 0.82),
+                    int(width * 0.70), int(height * 0.98),
                 )),
             ]
-            serial_candidates = []
-            for serial_region in serial_regions:
-                serial_region = self._preprocess_pil_image(serial_region)
-                for config in (
-                    "--psm 7 -c tessedit_char_whitelist=0123456789OQDILZSBG",
-                    "--psm 6 -c tessedit_char_whitelist=0123456789OQDILZSBG",
-                ):
-                    serial_text = self.pytesseract.image_to_string(
-                        serial_region,
-                        config=config,
-                    )
-                    serial_candidates.extend(self._numeric_sequences(serial_text, 6, 6))
-                    serial_candidates.extend(self._numeric_sequences(serial_text, 5, 8))
+
+            def read_serial_candidates(serial_region):
+                candidates = []
+                for processed_region in self._micr_preprocess_variants(serial_region):
+                    for config in (
+                        "--psm 7 -c tessedit_char_whitelist=0123456789OQDILZSBG",
+                        "--psm 6 -c tessedit_char_whitelist=0123456789OQDILZSBG",
+                    ):
+                        serial_text = self.pytesseract.image_to_string(
+                            processed_region,
+                            config=config,
+                        )
+                        # A cheque serial is always the *first six-digit block*
+                        # in the MICR line.  Do not retain 5- or 7/8-digit
+                        # candidates: those can be an OCR fragment of an account
+                        # number or a MICR transaction/routing component.
+                        candidates.extend(self._numeric_sequences(serial_text, 6, 6))
+                        serial = self._first_micr_serial(serial_text)
+                        if serial:
+                            candidates.append(serial)
+                return candidates
 
             # CTS-2010 is commonly printed vertically on the left border.
             cts_region = image.crop((
@@ -316,10 +432,16 @@ class OCRService:
             # On the MICR line the cheque serial is the first six digits. OCR
             # commonly reads the adjacent MICR separator as letters, so
             # normalise those symbols before taking that serial component.
-            if serial_candidates:
-                six_digit = next((candidate for candidate in serial_candidates if len(candidate) == 6), "")
-                serial_digits = six_digit or serial_candidates[0]
-                hints.append(f"MICR Cheque No: {serial_digits}")
+            # Stop as soon as a compact, dynamically detected MICR row has a
+            # verified consensus.  Broad fallback bands are used only when
+            # necessary, so unrelated lower-page text cannot outvote it.
+            serial = ""
+            for serial_region in detected_serial_regions + fallback_serial_regions:
+                serial = self._select_micr_serial(read_serial_candidates(serial_region))
+                if serial:
+                    break
+            if serial:
+                hints.append(f"MICR Cheque No: {serial}")
 
             cts_text = " ".join(cts_texts).upper()
             # Rotated OCR can read CTS as SLO/SIO and 2010 backwards as 0102.
@@ -329,18 +451,28 @@ class OCRService:
                 hints.append("CTS-2010")
 
             # Full-page OCR can mistake MICR digits for an account number.
-            # Prefer the printed A/c box in the middle/lower-left area.  The
-            # region is deliberately broad enough for common Indian cheque
-            # templates while excluding the MICR line at the very bottom.
-            account_region = image.crop((
-                int(width * 0.03), int(height * 0.45),
-                int(width * 0.45), int(height * 0.65),
-            ))
+            # On this cheque template the printed A/c number is in a compact
+            # lower-left box.  Read that box first: the earlier broad crop
+            # mixed in surrounding print and shortened leading zeroes.
+            account_regions = [
+                image.crop((
+                    int(width * 0.24), int(height * 0.50),
+                    int(width * 0.41), int(height * 0.55),
+                )),
+                # Fallback for templates whose account box is in a different
+                # lower-left position.
+                image.crop((
+                    int(width * 0.03), int(height * 0.45),
+                    int(width * 0.45), int(height * 0.65),
+                )),
+            ]
+
             account_texts = []
-            for psm in (6, 11):
-                account_texts.append(self.pytesseract.image_to_string(
-                    self._preprocess_pil_image(account_region), config=f"--psm {psm}"
-                ))
+            for account_region in account_regions:
+                for psm in (13, 7, 6, 11):
+                    account_texts.append(self.pytesseract.image_to_string(
+                        self._preprocess_pil_image(account_region), config=f"--psm {psm}"
+                    ))
 
             for account_text in account_texts:
                 # Accept OCR's usual look-alike characters only in this
